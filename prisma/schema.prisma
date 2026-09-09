@@ -1,0 +1,192 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL")
+}
+
+enum Role {
+  administrateur
+  technicien
+  locataire
+}
+
+enum Specialite {
+  plomberie
+  electricite
+  batiment
+  climatisation
+  generale
+}
+
+enum CriticiteBatiment {
+  standard
+  importante
+  strategique
+}
+
+enum TypeIncident {
+  fuiteEau
+  panneElectrique
+  degradationStructurelle
+  panneClimatisation
+  problemePlomberie
+  panneAscenseur
+  securiteIncendie
+  autre
+}
+
+enum NiveauUrgence {
+  faible
+  moyenne
+  elevee
+  critique
+}
+
+enum StatutIncident {
+  nouveau
+  affecte
+  enCours
+  enAttenteDePiece
+  resolu
+  enAttenteValidation
+  cloture
+}
+
+model User {
+  id            String       @id @default(cuid())
+  nom           String
+  prenom        String
+  email         String       @unique
+  telephone     String
+  passwordHash  String
+  role          Role
+  specialite    Specialite?
+  chambreId     String?
+  chambre       Chambre?     @relation(fields: [chambreId], references: [id])
+  actif         Boolean      @default(true)
+  dateCreation  DateTime     @default(now())
+  photoUrl      String?
+
+  incidentsSignales   Incident[]        @relation("IncidentLocataire")
+  incidentsAffectes   Incident[]        @relation("IncidentTechnicien")
+  changementsStatut   ChangementStatut[]
+  comptesRendus       CompteRendu[]
+  notifications       Notification[]
+
+  @@map("users")
+}
+
+model Batiment {
+  id        String            @id @default(cuid())
+  nom       String
+  code      String            @unique
+  adresse   String
+  criticite CriticiteBatiment @default(standard)
+
+  chambres  Chambre[]
+  incidents Incident[]
+
+  @@map("batiments")
+}
+
+model Chambre {
+  id          String    @id @default(cuid())
+  batimentId  String
+  batiment    Batiment  @relation(fields: [batimentId], references: [id], onDelete: Cascade)
+  numero      String
+  description String?
+
+  utilisateurs User[]
+
+  @@unique([batimentId, numero])
+  @@map("chambres")
+}
+
+model Incident {
+  id                   String          @id @default(cuid())
+  batimentId           String
+  batiment             Batiment        @relation(fields: [batimentId], references: [id])
+  localisationPrecise  String
+  type                 TypeIncident
+  description          String
+  photos               String[]        @default([])
+  urgence              NiveauUrgence
+  scoreUrgence         Float
+  facteursUrgence      String[]        @default([])
+  statut               StatutIncident  @default(nouveau)
+  locataireId          String
+  locataire            User            @relation("IncidentLocataire", fields: [locataireId], references: [id])
+  technicienAssigneId  String?
+  technicienAssigne    User?           @relation("IncidentTechnicien", fields: [technicienAssigneId], references: [id])
+  dateSignalement      DateTime        @default(now())
+
+  historique     ChangementStatut[]
+  comptesRendus  CompteRendu[]
+  notifications  Notification[]
+
+  @@map("incidents")
+}
+
+model ChangementStatut {
+  id          String         @id @default(cuid())
+  incidentId  String
+  incident    Incident       @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  statut      StatutIncident
+  date        DateTime       @default(now())
+  auteurId    String
+  auteur      User           @relation(fields: [auteurId], references: [id])
+  commentaire String?
+
+  @@map("changements_statut")
+}
+
+model CompteRendu {
+  id               String   @id @default(cuid())
+  incidentId       String
+  incident         Incident @relation(fields: [incidentId], references: [id], onDelete: Cascade)
+  technicienId     String
+  technicien       User     @relation(fields: [technicienId], references: [id])
+  description      String
+  piecesUtilisees  String?
+  dureeMinutes     Int?
+  date             DateTime @default(now())
+
+  @@map("comptes_rendus")
+}
+
+/// Notification in-app : créée par le backend lors d'un événement pertinent
+/// pour un utilisateur donné (affectation, changement de statut, ajout d'un
+/// compte-rendu). Consultée via GET /notifications, marquée lue via PATCH.
+/// `incidentId` est optionnel et sans cascade destructrice : si l'incident
+/// est supprimé, la notification reste mais perd son lien (SetNull).
+model Notification {
+  id            String    @id @default(cuid())
+  utilisateurId String
+  utilisateur   User      @relation(fields: [utilisateurId], references: [id], onDelete: Cascade)
+  message       String
+  incidentId    String?
+  incident      Incident? @relation(fields: [incidentId], references: [id], onDelete: SetNull)
+  lu            Boolean   @default(false)
+  date          DateTime  @default(now())
+
+  @@map("notifications")
+}
+
+/// utilisateurId n'est PAS une relation vers User : certaines actions sont
+/// enregistrées avec la valeur littérale "système" (voir dette technique
+/// notée dans la doc du projet), donc une contrainte de clé étrangère
+/// casserait ces écritures.
+model AuditLogEntry {
+  id            String   @id @default(cuid())
+  date          DateTime @default(now())
+  utilisateurId String
+  action        String
+  cible         String
+  details       String?
+
+  @@map("audit_log_entries")
+}
