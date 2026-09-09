@@ -143,7 +143,10 @@ usersRouter.patch('/moi/mot-de-passe', async (req: AuthenticatedRequest, res: Re
   }
 
   const passwordHash = await hashPassword(nouveauMotDePasse);
-  await prisma.user.update({ where: { id: existant.id }, data: { passwordHash } });
+  await prisma.user.update({
+    where: { id: existant.id },
+    data: { passwordHash, doitChangerMotDePasse: false },
+  });
 
   await prisma.auditLogEntry.create({
     data: {
@@ -207,6 +210,7 @@ usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRe
       specialite: role === Role.technicien ? (specialite ?? null) : null,
       chambreId: role === Role.locataire ? (chambreId ?? null) : null,
       passwordHash,
+      doitChangerMotDePasse: true,
     },
   });
 
@@ -299,7 +303,7 @@ usersRouter.patch(
 
     const utilisateur = await prisma.user.update({
       where: { id: req.params.id },
-      data: { passwordHash },
+      data: { passwordHash, doitChangerMotDePasse: true },
     });
 
     await prisma.auditLogEntry.create({

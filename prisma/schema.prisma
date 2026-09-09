@@ -70,6 +70,14 @@ model User {
   actif         Boolean      @default(true)
   dateCreation  DateTime     @default(now())
   photoUrl      String?
+  // true chaque fois qu'un administrateur choisit lui-même le mot de passe
+  // du compte (création ou réinitialisation de dépannage) : force un
+  // changement obligatoire à la connexion suivante, pour que l'admin ne
+  // reste pas connaisseur permanent du mot de passe réel de l'utilisateur.
+  // Remis à false dès que l'utilisateur le change lui-même (PATCH
+  // /moi/mot-de-passe). Par défaut false pour ne pas piéger les comptes
+  // déjà actifs avant l'ajout de ce champ.
+  doitChangerMotDePasse Boolean @default(false)
 
   incidentsSignales   Incident[]        @relation("IncidentLocataire")
   incidentsAffectes   Incident[]        @relation("IncidentTechnicien")
