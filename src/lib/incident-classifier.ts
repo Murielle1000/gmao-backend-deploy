@@ -1,4 +1,3 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { TypeIncident } from '@prisma/client';
 
 // Suggestion IA du type d'incident à partir de la description libre saisie
@@ -7,10 +6,12 @@ import { TypeIncident } from '@prisma/client';
 // niveau d'urgence, lui, reste calculé par le moteur déterministe existant
 // (`priority-engine.ts`) une fois le type connu : pas besoin d'IA pour ça.
 //
-// Utilise l'API Messages d'Anthropic avec un "tool" à schéma contraint
-// (plutôt que de faire écrire du JSON libre au modèle et de le parser) :
-// le type renvoyé est garanti appartenir à l'énumération Prisma, ce qui
-// évite toute valeur inventée par le modèle.
+// Utilise l'API Gemini (Google AI Studio, palier gratuit sans carte
+// bancaire — voir aistudio.google.com) en sortie structurée contrainte par
+// un schéma JSON (`responseSchema`) plutôt que du texte libre à parser : le
+// type renvoyé est garanti appartenir à l'énumération Prisma, ce qui évite
+// toute valeur inventée par le modèle. Appel fait en HTTP brut (fetch natif
+// de Node) plutôt qu'avec un SDK, pour ne pas ajouter de dépendance.
 
 const TYPES_VALIDES = Object.values(TypeIncident);
 
@@ -25,61 +26,14 @@ const LABEL_TYPE: Record<TypeIncident, string> = {
   autre: 'Autre',
 };
 
-// Modèle rapide et économique : suffisant pour une classification à 8
-// catégories, pas besoin d'un modèle plus coûteux pour cette tâche.
-const MODELE = 'claude-haiku-4-5-20251001';
-
-const OUTIL_CLASSIFICATION: Anthropic.Tool = {
-  name: 'classifier_incident',
-  description:
-    "Enregistre la catégorie d'incident de maintenance immobilière la plus adaptée à la description fournie.",
-  input_schema: {
-    type: 'object',
-    properties: {
-      type: {
-        type: 'string',
-        enum: TYPES_VALIDES,
-        description: 'Catégorie la plus adaptée parmi celles proposées.',
-      },
-      justification: {
-        type: 'string',
-        description:
-          'Courte explication en français (une phrase) de pourquoi cette catégorie a été choisie.',
-      },
-    },
-    required: ['type', 'justification'],
-  },
-};
+// Modèle rapide, gratuit sur le palier gratuit de Google AI Studio :
+// suffisant pour une classification à 8 catégories.
+const MODELE = 'gemini-2.0-flash';
+const URL_GEMINI = `https://generativelanguage.googleapis.com/v1beta/models/${MODELE}:generateContent`;
 
 export interface SuggestionType {
   type: TypeIncident;
   justification: string;
-}
-
-let client: Anthropic | null = null;
-
-function obtenirClient(): Anthropic {
-  const cle = process.env.ANTHROPIC_API_KEY;
-  if (!cle) {
-    throw new Error(
-      "ANTHROPIC_API_KEY absente de la configuration : la suggestion IA n'est pas disponible.",
-    );
-  }
-  if (!client) {
-    // Nécessaire pour certaines clés API créées sans workspace précis
-    // dans la console Anthropic ("This API key is not scoped to a
-    // workspace") : l'appel échoue en 400 tant que l'ID du workspace
-    // n'est pas fourni explicitement. Optionnel — sans effet pour une clé
-    // déjà rattachée à un workspace.
-    const idWorkspace = process.env.ANTHROPIC_WORKSPACE_ID;
-    client = new Anthropic({
-      apiKey: cle,
-      defaultHeaders: idWorkspace
-        ? { 'anthropic-workspace-id': idWorkspace }
-        : undefined,
-    });
-  }
-  return client;
 }
 
 /// Lève une erreur si la classification échoue (clé absente, description
@@ -93,34 +47,81 @@ export async function suggererTypeIncident(description: string): Promise<Suggest
     throw new Error('Description trop courte pour être analysée.');
   }
 
+  const cle = process.env.GEMINI_API_KEY;
+  if (!cle) {
+    throw new Error(
+      "GEMINI_API_KEY absente de la configuration : la suggestion IA n'est pas disponible.",
+    );
+  }
+
   const listeCategories = TYPES_VALIDES.map((t) => `- ${t} : ${LABEL_TYPE[t]}`).join('\n');
 
-  const message = await obtenirClient().messages.create({
-    model: MODELE,
-    max_tokens: 300,
-    system:
-      "Tu aides à trier des signalements d'incidents de maintenance dans un immeuble, à partir de la " +
-      "description écrite par un locataire (souvent informelle, parfois imprécise). Choisis toujours la " +
-      "catégorie la plus adaptée dans la liste fournie, même en cas de doute — utilise \"autre\" seulement " +
-      "si vraiment aucune catégorie ne correspond.",
-    tools: [OUTIL_CLASSIFICATION],
-    tool_choice: { type: 'tool', name: 'classifier_incident' },
-    messages: [
-      {
-        role: 'user',
-        content: `Catégories disponibles :\n${listeCategories}\n\nDescription du locataire :\n"""${texte}"""`,
+  const reponse = await fetch(`${URL_GEMINI}?key=${cle}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [
+          {
+            text:
+              "Tu aides à trier des signalements d'incidents de maintenance dans un immeuble, à partir " +
+              "de la description écrite par un locataire (souvent informelle, parfois imprécise). Choisis " +
+              'toujours la catégorie la plus adaptée dans la liste fournie, même en cas de doute — utilise ' +
+              '"autre" seulement si vraiment aucune catégorie ne correspond.',
+          },
+        ],
       },
-    ],
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: `Catégories disponibles :\n${listeCategories}\n\nDescription du locataire :\n"""${texte}"""`,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'OBJECT',
+          properties: {
+            type: {
+              type: 'STRING',
+              enum: TYPES_VALIDES,
+              description: 'Catégorie la plus adaptée parmi celles proposées.',
+            },
+            justification: {
+              type: 'STRING',
+              description: 'Courte explication en français (une phrase) de pourquoi cette catégorie a été choisie.',
+            },
+          },
+          required: ['type', 'justification'],
+        },
+      },
+    }),
   });
 
-  const appelOutil = message.content.find(
-    (bloc): bloc is Anthropic.ToolUseBlock => bloc.type === 'tool_use',
-  );
-  if (!appelOutil) {
+  if (!reponse.ok) {
+    const corpsErreur = await reponse.text();
+    throw new Error(`Appel Gemini échoué (HTTP ${reponse.status}) : ${corpsErreur}`);
+  }
+
+  const donnees = (await reponse.json()) as {
+    candidates?: { content?: { parts?: { text?: string }[] } }[];
+  };
+  const texteJson = donnees.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (typeof texteJson !== 'string') {
     throw new Error("L'IA n'a renvoyé aucune classification exploitable.");
   }
 
-  const entree = appelOutil.input as { type?: string; justification?: string };
+  let entree: { type?: string; justification?: string };
+  try {
+    entree = JSON.parse(texteJson);
+  } catch {
+    throw new Error("Réponse de l'IA illisible (JSON invalide).");
+  }
+
   if (!entree.type || !TYPES_VALIDES.includes(entree.type as TypeIncident)) {
     throw new Error('Type suggéré par l’IA invalide.');
   }
