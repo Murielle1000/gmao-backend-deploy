@@ -62,7 +62,19 @@ model User {
   prenom        String
   email         String       @unique
   telephone     String
-  passwordHash  String
+  // Nullable : un compte fraîchement créé par un administrateur n'a PAS
+  // encore de mot de passe — seulement un code d'activation (ci-dessous).
+  // L'utilisateur choisit lui-même son mot de passe via POST
+  // /auth/activer ; l'administrateur ne le connaît donc jamais, même
+  // brièvement (contrairement à l'ancien design où il le tapait lui-même).
+  passwordHash  String?
+  // Hashé comme un mot de passe (même mécanisme bcrypt) bien que ce ne
+  // soit qu'un code à usage unique et à durée de vie courte — inutile
+  // pour un attaquant une fois `codeActivationExpiration` dépassée ou le
+  // compte activé (passwordHash non-null), mais autant ne jamais stocker
+  // de secret en clair par principe.
+  codeActivationHash       String?
+  codeActivationExpiration DateTime?
   role          Role
   specialite    Specialite?
   chambreId     String?
@@ -70,14 +82,6 @@ model User {
   actif         Boolean      @default(true)
   dateCreation  DateTime     @default(now())
   photoUrl      String?
-  // true chaque fois qu'un administrateur choisit lui-même le mot de passe
-  // du compte (création ou réinitialisation de dépannage) : force un
-  // changement obligatoire à la connexion suivante, pour que l'admin ne
-  // reste pas connaisseur permanent du mot de passe réel de l'utilisateur.
-  // Remis à false dès que l'utilisateur le change lui-même (PATCH
-  // /moi/mot-de-passe). Par défaut false pour ne pas piéger les comptes
-  // déjà actifs avant l'ajout de ce champ.
-  doitChangerMotDePasse Boolean @default(false)
 
   incidentsSignales   Incident[]        @relation("IncidentLocataire")
   incidentsAffectes   Incident[]        @relation("IncidentTechnicien")

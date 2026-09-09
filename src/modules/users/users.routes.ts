@@ -1,6 +1,8 @@
 import { Role, Specialite } from '@prisma/client';
 import { Response, Router } from 'express';
 
+import { dateExpirationActivation, genererCodeActivation } from '../../lib/code-activation';
+import { envoyerEmailActivation } from '../../lib/mailer';
 import { comparePassword, hashPassword } from '../../lib/password';
 import { prisma } from '../../lib/prisma';
 import { AuthenticatedRequest, authenticate, requireRole } from '../../middleware/auth';
@@ -10,10 +12,11 @@ export const usersRouter = Router();
 usersRouter.use(authenticate);
 
 /// Longueur minimale volontairement modeste (usage interne RPI-PAD, pas
-/// de politique de mot de passe imposée par le cahier des charges) : ce
-/// qui compte est que l'administrateur choisisse lui-même le mot de passe
-/// (plus de génération aléatoire "temporaire") et que chaque utilisateur
-/// puisse ensuite le changer lui-même — voir /moi/mot-de-passe ci-dessous.
+/// de politique de mot de passe imposée par le cahier des charges) —
+/// utilisée pour le mot de passe choisi par l'utilisateur lui-même, à
+/// l'activation (POST /auth/activer) ou à un changement volontaire
+/// (PATCH /moi/mot-de-passe). L'administrateur ne choisit plus jamais de
+/// mot de passe : voir /:id/regenerer-code-activation ci-dessous.
 function validerMotDePasse(motDePasse: string): string | null {
   if (motDePasse.length < 6) {
     return 'Le mot de passe doit contenir au moins 6 caractères.';
@@ -21,8 +24,10 @@ function validerMotDePasse(motDePasse: string): string | null {
   return null;
 }
 
-function sansMotDePasse<T extends { passwordHash: string }>(utilisateur: T) {
-  const { passwordHash: _passwordHash, ...reste } = utilisateur;
+function sansMotDePasse<T extends { passwordHash: string | null; codeActivationHash: string | null }>(
+  utilisateur: T,
+) {
+  const { passwordHash: _passwordHash, codeActivationHash: _codeActivationHash, ...reste } = utilisateur;
   return reste;
 }
 
@@ -111,8 +116,8 @@ usersRouter.patch('/moi', async (req: AuthenticatedRequest, res: Response) => {
 // ouverte sur un appareil emprunté). C'est la seule route qui met à jour
 // un mot de passe sans passer par l'administrateur : une fois qu'un
 // utilisateur l'a utilisée, l'administrateur ne connaît plus son mot de
-// passe réel (il peut seulement le réinitialiser en dépannage, voir
-// PATCH /:id/reinitialiser-mot-de-passe).
+// passe réel (il peut seulement lui envoyer un nouveau code d'activation
+// en dépannage, voir PATCH /:id/regenerer-code-activation).
 usersRouter.patch('/moi/mot-de-passe', async (req: AuthenticatedRequest, res: Response) => {
   const { motDePasseActuel, nouveauMotDePasse } = req.body as {
     motDePasseActuel?: string;
@@ -136,6 +141,11 @@ usersRouter.patch('/moi/mot-de-passe', async (req: AuthenticatedRequest, res: Re
     return;
   }
 
+  if (!existant.passwordHash) {
+    res.status(409).json({ message: 'Compte pas encore activé — utilisez le code d’activation reçu.' });
+    return;
+  }
+
   const motDePasseValide = await comparePassword(motDePasseActuel, existant.passwordHash);
   if (!motDePasseValide) {
     res.status(401).json({ message: 'Mot de passe actuel incorrect.' });
@@ -145,7 +155,7 @@ usersRouter.patch('/moi/mot-de-passe', async (req: AuthenticatedRequest, res: Re
   const passwordHash = await hashPassword(nouveauMotDePasse);
   await prisma.user.update({
     where: { id: existant.id },
-    data: { passwordHash, doitChangerMotDePasse: false },
+    data: { passwordHash },
   });
 
   await prisma.auditLogEntry.create({
@@ -169,7 +179,7 @@ usersRouter.get('/:id', requireRole('administrateur'), async (req: Authenticated
 });
 
 usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRequest, res: Response) => {
-  const { nom, prenom, email, telephone, role, specialite, chambreId, motDePasse } = req.body as {
+  const { nom, prenom, email, telephone, role, specialite, chambreId } = req.body as {
     nom?: string;
     prenom?: string;
     email?: string;
@@ -177,17 +187,10 @@ usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRe
     role?: Role;
     specialite?: Specialite | null;
     chambreId?: string | null;
-    motDePasse?: string;
   };
 
-  if (!nom || !prenom || !email || !telephone || !role || !motDePasse) {
+  if (!nom || !prenom || !email || !telephone || !role) {
     res.status(400).json({ message: 'Champs obligatoires manquants.' });
-    return;
-  }
-
-  const erreurValidation = validerMotDePasse(motDePasse);
-  if (erreurValidation) {
-    res.status(400).json({ message: erreurValidation });
     return;
   }
 
@@ -198,7 +201,12 @@ usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRe
     return;
   }
 
-  const passwordHash = await hashPassword(motDePasse);
+  // Pas de mot de passe choisi par l'administrateur : un code d'activation
+  // à usage unique est généré, affiché une seule fois dans la réponse, et
+  // transmis par email en best-effort — voir POST /auth/activer, où
+  // l'utilisateur choisira lui-même son mot de passe définitif.
+  const codeActivation = genererCodeActivation();
+  const codeActivationHash = await hashPassword(codeActivation);
 
   const utilisateur = await prisma.user.create({
     data: {
@@ -209,8 +217,9 @@ usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRe
       role,
       specialite: role === Role.technicien ? (specialite ?? null) : null,
       chambreId: role === Role.locataire ? (chambreId ?? null) : null,
-      passwordHash,
-      doitChangerMotDePasse: true,
+      passwordHash: null,
+      codeActivationHash,
+      codeActivationExpiration: dateExpirationActivation(),
     },
   });
 
@@ -223,7 +232,17 @@ usersRouter.post('/', requireRole('administrateur'), async (req: AuthenticatedRe
     },
   });
 
-  res.status(201).json(sansMotDePasse(utilisateur));
+  const emailEnvoye = await envoyerEmailActivation({
+    destinataire: utilisateur.email,
+    prenom: utilisateur.prenom,
+    codeActivation,
+  });
+
+  res.status(201).json({
+    utilisateur: sansMotDePasse(utilisateur),
+    codeActivation,
+    emailEnvoye,
+  });
 });
 
 usersRouter.patch('/:id', requireRole('administrateur'), async (req: AuthenticatedRequest, res: Response) => {
@@ -269,52 +288,55 @@ usersRouter.patch('/:id', requireRole('administrateur'), async (req: Authenticat
   res.json(sansMotDePasse(utilisateur));
 });
 
-// PATCH /:id/reinitialiser-mot-de-passe — dépannage administrateur : un
-// utilisateur bloqué (mot de passe oublié, compte jamais activé) reçoit
-// un nouveau mot de passe choisi par l'administrateur, à lui transmettre
-// directement. Contrairement à /moi/mot-de-passe, aucune vérification de
-// l'ancien mot de passe n'est nécessaire ici (l'administrateur agit sur
-// un compte qui n'est pas le sien) — c'est la seule façon pour lui de
-// "gérer l'accès" d'un utilisateur sans jamais connaître le mot de passe
-// que cet utilisateur choisira ensuite lui-même.
+// PATCH /:id/regenerer-code-activation — dépannage administrateur : un
+// utilisateur bloqué (compte jamais activé, code expiré, ou mot de passe
+// oublié) reçoit un nouveau code d'activation à usage unique. Contrairement
+// à /moi/mot-de-passe, aucune vérification de l'ancien mot de passe n'est
+// nécessaire ici (l'administrateur agit sur un compte qui n'est pas le
+// sien). Le compte repasse par le flux d'activation (POST /auth/activer,
+// passwordHash remis à null) : l'administrateur ne choisit et ne connaît
+// donc jamais le mot de passe que l'utilisateur se donnera ensuite.
 usersRouter.patch(
-  '/:id/reinitialiser-mot-de-passe',
+  '/:id/regenerer-code-activation',
   requireRole('administrateur'),
   async (req: AuthenticatedRequest, res: Response) => {
-    const { motDePasse } = req.body as { motDePasse?: string };
-    if (!motDePasse) {
-      res.status(400).json({ message: 'motDePasse requis.' });
-      return;
-    }
-
-    const erreurValidation = validerMotDePasse(motDePasse);
-    if (erreurValidation) {
-      res.status(400).json({ message: erreurValidation });
-      return;
-    }
-
     const existant = await prisma.user.findUnique({ where: { id: req.params.id } });
     if (!existant) {
       res.status(404).json({ message: 'Utilisateur introuvable.' });
       return;
     }
 
-    const passwordHash = await hashPassword(motDePasse);
+    const codeActivation = genererCodeActivation();
+    const codeActivationHash = await hashPassword(codeActivation);
 
     const utilisateur = await prisma.user.update({
       where: { id: req.params.id },
-      data: { passwordHash, doitChangerMotDePasse: true },
+      data: {
+        passwordHash: null,
+        codeActivationHash,
+        codeActivationExpiration: dateExpirationActivation(),
+      },
     });
 
     await prisma.auditLogEntry.create({
       data: {
         utilisateurId: req.utilisateur!.id,
-        action: 'Réinitialisation du mot de passe',
+        action: "Régénération du code d'activation",
         cible: `${utilisateur.prenom} ${utilisateur.nom}`,
       },
     });
 
-    res.json(sansMotDePasse(utilisateur));
+    const emailEnvoye = await envoyerEmailActivation({
+      destinataire: utilisateur.email,
+      prenom: utilisateur.prenom,
+      codeActivation,
+    });
+
+    res.json({
+      utilisateur: sansMotDePasse(utilisateur),
+      codeActivation,
+      emailEnvoye,
+    });
   },
 );
 
