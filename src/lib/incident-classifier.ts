@@ -28,7 +28,7 @@ const LABEL_TYPE: Record<TypeIncident, string> = {
 
 // Modèle rapide, gratuit sur le palier gratuit de Google AI Studio :
 // suffisant pour une classification à 8 catégories.
-const MODELE = 'gemini-2.0-flash';
+const MODELE = 'gemini-3.6-flash';
 const URL_GEMINI = `https://generativelanguage.googleapis.com/v1beta/models/${MODELE}:generateContent`;
 
 export interface SuggestionType {
