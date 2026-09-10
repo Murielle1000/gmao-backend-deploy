@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "gmao-web-preview",
+      "runtimeExecutable": "D:\\Murielle\\K2M\\STAGE 3\\gmao_backend\\run-web-preview.cmd",
+      "runtimeArgs": [],
+      "port": 8765
+    }
+  ]
+}
